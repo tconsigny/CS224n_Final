@@ -4,7 +4,9 @@ import os
 from collections import OrderedDict
 import torch
 import csv
+import torch.nn as nn
 import util
+import numpy as np
 from transformers import DistilBertTokenizerFast
 from transformers import DistilBertForQuestionAnswering
 from transformers import AdamW
@@ -151,24 +153,40 @@ class Trainer():
     def save(self, model):
         model.save_pretrained(self.path)
 
-    def evaluate(self, model, data_loader, data_dict, return_preds=False, split='validation'):
+    def evaluate(self, model, data_loader, data_dict, return_preds=False, split='validation', experts):
         device = self.device
 
         model.eval()
         pred_dict = {}
+        
         all_start_logits = []
         all_end_logits = []
+
         with torch.no_grad(), \
                 tqdm(total=len(data_loader.dataset)) as progress_bar:
+            #use stochastic with MoE
             for batch in data_loader:
                 # Setup for forward
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 batch_size = len(input_ids)
-                outputs = model(input_ids, attention_mask=attention_mask)
-                # Forward
-                start_logits, end_logits = outputs.start_logits, outputs.end_logits
-                # TODO: compute loss
+
+                if experts is False:
+                    outputs = model(input_ids, attention_mask=attention_mask)
+                    start_logits, end_logits = outputs.start_logits, outputs.end_logits
+                else:
+                    outputs1 = model.expert1(input_ids, attention_mask=attention_mask)
+                    start_logits1, end_logits1 = outputs1.start_logits, outputs1.end_logits
+                    outputs2 = model.expert2(input_ids, attention_mask=attention_mask)
+                    start_logits2, end_logits2 = outputs2.start_logits, outputs2.end_logits
+                    outputs3 = model.expert3(input_ids, attention_mask=attention_mask)
+                    start_logits3, end_logits3 = outputs3.start_logits, outputs3.end_logits
+
+                    expert_weights = model.gate.forward(example)
+                    start_logits = start_logits1 * expert_weights[0] + start_logits2 * expert_weights[1] + 
+                    start_logits3 * expert_weights[2]
+                    end_logits = end_logits1 * expert_weights[0] + end_logits2 * expert_weights[1] + 
+                    end_logits3 * expert_weights[2]
 
                 all_start_logits.append(start_logits)
                 all_end_logits.append(end_logits)
@@ -192,28 +210,60 @@ class Trainer():
             return preds, results
         return results
 
-    def train(self, model, train_dataloader, eval_dataloader, val_dict):
+    def train(self, model, train_dataloader, eval_dataloader, val_dict, experts):
         device = self.device
-        model.to(device)
-        optim = AdamW(model.parameters(), lr=self.lr)
+
+        if experts is False:
+            model.to(device)
+            optim = AdamW(model.parameters(), lr=self.lr)
+        else:
+            model.gate.to(device)
+            optim = AdamW(model.gate.parameters(), lr=self.lr)
+
         global_idx = 0
         best_scores = {'F1': -1.0, 'EM': -1.0}
         tbx = SummaryWriter(self.save_dir)
 
+        
         for epoch_num in range(self.num_epochs):
             self.log.info(f'Epoch: {epoch_num}')
             with torch.enable_grad(), tqdm(total=len(train_dataloader.dataset)) as progress_bar:
+                #remember stochastic for MoE
                 for batch in train_dataloader:
                     optim.zero_grad()
-                    model.train()
+                    if experts:
+                        model.gate.train()
+                        model.expert1.eval()
+                        model.expert2.eval()
+                        model.expert3.eval()
+                    else:
+                        model.train()
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
                     start_positions = batch['start_positions'].to(device)
                     end_positions = batch['end_positions'].to(device)
-                    outputs = model(input_ids, attention_mask=attention_mask,
+                    
+                    if experts:
+                        outputs1 = model.expert1(input_ids, attention_mask=attention_mask)
+                        start_logits1, end_logits1 = outputs1.start_logits, outputs1.end_logits
+                        outputs2 = model.expert2(input_ids, attention_mask=attention_mask)
+                        start_logits2, end_logits2 = outputs2.start_logits, outputs2.end_logits
+                        outputs3 = model.expert3(input_ids, attention_mask=attention_mask)
+                        start_logits3, end_logits3 = outputs3.start_logits, outputs3.end_logits
+
+                        expert_weights = model.gate.forward(example)
+                        start_logits = start_logits1 * expert_weights[0] + start_logits2 * expert_weights[1] + 
+                            start_logits3 * expert_weights[2]
+                        end_logits = end_logits1 * expert_weights[0] + end_logits2 * expert_weights[1] + 
+                            end_logits3 * expert_weights[2]
+                        loss = -np.log(start_logits[0][start_positions[0]]) - np.log(end_logits[0][end_positions[0]])
+
+                    else:
+                        outputs = model(input_ids, attention_mask=attention_mask,
                                     start_positions=start_positions,
                                     end_positions=end_positions)
-                    loss = outputs[0]
+                        loss = outputs[0]
+
                     loss.backward()
                     optim.step()
                     progress_bar.update(len(input_ids))
@@ -236,7 +286,10 @@ class Trainer():
                                            num_visuals=self.num_visuals)
                         if curr_score['F1'] >= best_scores['F1']:
                             best_scores = curr_score
-                            self.save(model)
+                            if experts:
+                                self.save(model.gate)
+                            else:
+                                self.save(model)
                     global_idx += 1
         return best_scores
 
@@ -252,11 +305,38 @@ def get_dataset(args, datasets, data_dir, tokenizer, split_name):
     return util.QADataset(data_encodings, train=(split_name=='train')), dataset_dict
 
 def main():
+
     # define parser and arguments
     args = get_train_test_args()
 
     util.set_seed(args.seed)
-    model = DistilBertForQuestionAnswering.from_pretrained("distilbert-base-uncased")
+
+    if args.mixture_of_experts and args.do_eval:
+        model = MoE(load_gate=True)
+        experts = True
+        model.gate.eval()
+
+    elif args.mixture_of_experts and args.do_train:
+        model = MoE(load_gate=False)
+        experts = True
+
+    else:
+        model = DistilBertForQuestionAnswering.from_pretrained("distilbert-base-uncased")
+        experts = False
+
+    if args.reinit > 0:
+        transformer_temp = getattr(model, 'distilbert')
+        for layer in transformer_temp.transformer.layer[-args.reinit:]:
+            for module in layer.modules():
+                print(type(module))
+                if isinstance(module, (nn.Linear, nn.Embedding)):
+                    module.weight.data.normal_(mean=0.0, std=transformer_temp.config.initializer_range)
+                elif isinstance(module, nn.LayerNorm):
+                    module.bias.data.zero_()
+                    module.weight.data.fill_(1.0)
+                if isinstance(module, nn.Linear) and module.bias is not None:
+                    module.bias.data.zero_()
+
     tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
 
     if args.do_train:
@@ -277,22 +357,25 @@ def main():
         val_loader = DataLoader(val_dataset,
                                 batch_size=args.batch_size,
                                 sampler=SequentialSampler(val_dataset))
-        best_scores = trainer.train(model, train_loader, val_loader, val_dict)
+        best_scores = trainer.train(model, train_loader, val_loader, val_dict, experts)
     if args.do_eval:
         args.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         split_name = 'test' if 'test' in args.eval_dir else 'validation'
         log = util.get_logger(args.save_dir, f'log_{split_name}')
         trainer = Trainer(args, log)
-        checkpoint_path = os.path.join(args.save_dir, 'checkpoint')
-        model = DistilBertForQuestionAnswering.from_pretrained(checkpoint_path)
-        model.to(args.device)
+        if args.mixture_of_experts is False:
+            checkpoint_path = os.path.join(args.save_dir, 'checkpoint')
+            model = DistilBertForQuestionAnswering.from_pretrained(checkpoint_path)
+            model.to(args.device)
         eval_dataset, eval_dict = get_dataset(args, args.eval_datasets, args.eval_dir, tokenizer, split_name)
         eval_loader = DataLoader(eval_dataset,
                                  batch_size=args.batch_size,
                                  sampler=SequentialSampler(eval_dataset))
+    
         eval_preds, eval_scores = trainer.evaluate(model, eval_loader,
                                                    eval_dict, return_preds=True,
-                                                   split=split_name)
+                                                   split=split_name, MoE = True)
+
         results_str = ', '.join(f'{k}: {v:05.2f}' for k, v in eval_scores.items())
         log.info(f'Eval {results_str}')
         # Write submission file
